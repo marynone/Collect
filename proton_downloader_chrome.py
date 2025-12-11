@@ -2,7 +2,9 @@ import os
 import time
 import random 
 import glob 
-import json # <--- NEW: Import json for saving/loading server IDs
+import json 
+import zipfile # <--- NEW: for creating zip files
+import requests # <--- NEW: for interacting with Telegram API
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -16,10 +18,19 @@ CONFIRM_BUTTON_SELECTOR = (By.CSS_SELECTOR, ".button-solid-norm:nth-child(2)")
 
 # Constants
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloaded_configs")
-SERVER_ID_LOG_FILE = os.path.join(os.getcwd(), "downloaded_server_ids.json") # <--- NEW LOG FILE
-TARGET_COUNTRY_NAME = "United States"
-MAX_DOWNLOADS_PER_SESSION = 20 # Maximum downloads before relogin
+SERVER_ID_LOG_FILE = os.path.join(os.getcwd(), "downloaded_server_ids.json") 
+
+# --- CRITICAL CHANGE ---
+# TARGET_COUNTRY_NAME is now None to process all countries.
+TARGET_COUNTRY_NAME = None 
+# ------------------------
+
+MAX_DOWNLOADS_PER_SESSION = 20 # Maximum downloads before relogin (UNCHANGED)
 RELOGIN_DELAY = 120 # Delay in seconds between sessions to cool down the IP (2 minutes)
+
+# Environment variables will be read once at runtime
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Create the download directory if it doesn't exist
 if not os.path.exists(DOWNLOAD_DIR):
@@ -62,7 +73,6 @@ class ProtonVPN:
             self.driver.quit()
             print("WebDriver closed.")
 
-    # --- NEW: File Management Functions ---
     def load_downloaded_ids(self):
         """Loads the set of previously downloaded server IDs."""
         if os.path.exists(SERVER_ID_LOG_FILE):
@@ -78,7 +88,6 @@ class ProtonVPN:
         """Saves the set of downloaded server IDs."""
         with open(SERVER_ID_LOG_FILE, 'w') as f:
             json.dump(list(ids), f)
-    # -------------------------------------
             
     def login(self, username, password):
         try:
@@ -137,7 +146,7 @@ class ProtonVPN:
 
     def process_downloads(self, downloaded_ids):
         """
-        Processes downloads for the target country, skipping previously downloaded Server IDs.
+        Processes downloads for ALL countries, limited by MAX_DOWNLOADS_PER_SESSION.
         Returns (all_downloads_finished, downloaded_ids).
         """
         try:
@@ -164,15 +173,22 @@ class ProtonVPN:
                     country_name_element = country.find_element(By.CSS_SELECTOR, "summary")
                     country_name = country_name_element.text.split('\n')[0].strip()
                     
-                    if TARGET_COUNTRY_NAME not in country_name:
-                        continue
+                    # --- NEW LOGIC: Check if session limit is already reached ---
+                    if download_counter >= MAX_DOWNLOADS_PER_SESSION:
+                        print(f"Session limit reached ({MAX_DOWNLOADS_PER_SESSION}). Stopping for relogin...")
+                        all_downloads_finished = False 
+                        return all_downloads_finished, downloaded_ids
+                    # -----------------------------------------------------------
                     
-                    print(f"--- Processing target country: {country_name} ---")
+                    print(f"--- Processing country: {country_name} ---")
 
                     self.driver.execute_script("arguments[0].open = true;", country)
                     time.sleep(0.5)
 
                     rows = country.find_elements(By.CSS_SELECTOR, "tr")
+                    
+                    # Check if all configs in this country are already downloaded
+                    all_configs_in_country_downloaded = True 
 
                     for index, row in enumerate(rows[1:]): # Skip header row
                         
@@ -182,22 +198,25 @@ class ProtonVPN:
                             
                             # --- CRITICAL CHECK: Skip if Server ID is logged ---
                             if server_id in downloaded_ids:
-                                print(f"Skipping config (Server ID: {server_id}). Already logged.")
+                                # print(f"Skipping config (Server ID: {server_id}). Already logged.")
                                 continue
-                                # ----------------------------------------------------
                             
+                            # If we found one config NOT downloaded, the country is NOT finished
+                            all_configs_in_country_downloaded = False
+                            
+                            # --- Check session limit AGAIN before attempting download ---
+                            if download_counter >= MAX_DOWNLOADS_PER_SESSION:
+                                print(f"Session limit reached ({MAX_DOWNLOADS_PER_SESSION}). Stopping for relogin...")
+                                all_downloads_finished = False 
+                                return all_downloads_finished, downloaded_ids
+                            # -----------------------------------------------------------
+
                             btn = row.find_element(By.CSS_SELECTOR, ".button")
 
                         except Exception as e:
-                            print(f"Could not determine Server ID/Button for row {index}. Error: {e}")
+                            print(f"Could not determine Server ID/Button for row {index} in {country_name}. Error: {e}")
                             continue 
 
-                        # --- Check session limit ---
-                        if download_counter >= MAX_DOWNLOADS_PER_SESSION:
-                            print(f"Session limit reached ({MAX_DOWNLOADS_PER_SESSION}). Stopping for relogin...")
-                            all_downloads_finished = False 
-                            return all_downloads_finished, downloaded_ids
-                        
                         random_delay = random.randint(60, 90) 
                         
                         # --- Execute Download ---
@@ -224,29 +243,115 @@ class ProtonVPN:
                             downloaded_ids.add(server_id)
                             
                         except (TimeoutException, ElementClickInterceptedException) as e:
-                            print(f"CRITICAL ERROR: Failed to download config {server_id}. Rate limit or session issue detected. Shutting down session.")
+                            print(f"CRITICAL ERROR: Failed to download config {server_id} in {country_name}. Rate limit or session issue detected. Shutting down session.")
                             all_downloads_finished = False
                             return all_downloads_finished, downloaded_ids
                         
                         except Exception as e:
-                            print(f"General error during download {server_id}: {e}. Shutting down session.")
+                            print(f"General error during download {server_id} in {country_name}: {e}. Shutting down session.")
                             all_downloads_finished = False
                             return all_downloads_finished, downloaded_ids
                             
-                    print(f"All available configs for {country_name} processed in this run.")
-                    break 
-
+                    if all_configs_in_country_downloaded:
+                        print(f"All configs for {country_name} were already downloaded. Moving to next country.")
+                    else:
+                        print(f"Completed download attempts for {country_name} in this session.")
+                        
                 except Exception as e:
-                    print(f"Error processing country block: {e}")
-                    all_downloads_finished = False 
-                    return all_downloads_finished, downloaded_ids
-
+                    print(f"Error processing country block for {country_name}: {e}. Continuing to next country.")
+                    
+            # If the loop finishes without hitting the session limit, all downloads are complete.
+            all_downloads_finished = True 
 
         except Exception as e:
             print(f"Error in main download loop: {e}")
             all_downloads_finished = False
             
         return all_downloads_finished, downloaded_ids
+
+    
+    def organize_and_send_files(self):
+        """
+        Organizes downloaded files by country and sends a zip file for each country via Telegram.
+        """
+        print("\n###################### Organizing and Sending Files ######################")
+        
+        # 1. Group files by country code (e.g., "US", "JP", "CH")
+        country_files = {}
+        for filename in os.listdir(DOWNLOAD_DIR):
+            if filename.endswith(".ovpn") or filename.endswith(".conf"):
+                try:
+                    # Extract the country code from the start of the file name (e.g., "US" from "US-FREE#...")
+                    # This relies on ProtonVPN's consistent naming convention (e.g., US-FREE#2.conf)
+                    country_code = filename.split('-')[0].split('#')[0].upper()
+                    if len(country_code) > 2: # handle cases like "wg-CH" or "wg-US"
+                        if country_code.startswith("WG-"):
+                            country_code = country_code[3:]
+                        else: # Fallback for complex names
+                             country_code = filename.split('-')[0].upper()
+
+                    if len(country_code) > 2 and country_code.isalpha():
+                         # Assume 2-letter country code
+                        country_code = country_code[:2]
+
+
+                    if country_code not in country_files:
+                        country_files[country_code] = []
+                    
+                    country_files[country_code].append(os.path.join(DOWNLOAD_DIR, filename))
+                except Exception as e:
+                    print(f"Error processing filename {filename}: {e}")
+
+        if not country_files:
+            print("No new configuration files found to organize/send.")
+            return
+
+        print(f"Found files for {len(country_files)} unique countries: {', '.join(country_files.keys())}")
+
+        # 2. Zip and Send each country's files
+        for country_code, files in country_files.items():
+            zip_filename = f"{country_code}_ProtonVPN_Configs.zip"
+            zip_path = os.path.join(os.getcwd(), zip_filename)
+            
+            # Create the zip file
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in files:
+                    # Add file to zip with only the filename (not the full download path)
+                    zipf.write(file_path, os.path.basename(file_path))
+
+            print(f"Created {zip_filename} with {len(files)} configurations.")
+
+            # 3. Send to Telegram
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                caption = f"✅ کانفیگ‌های جدید WireGuard/OpenVPN برای کشور {country_code}."
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+
+                try:
+                    with open(zip_path, 'rb') as doc:
+                        response = requests.post(url, 
+                            data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}, 
+                            files={'document': doc}
+                        )
+                    if response.status_code == 200:
+                        print(f"Successfully sent {zip_filename} to Telegram.")
+                    else:
+                        print(f"Failed to send {zip_filename} to Telegram. Status code: {response.status_code}, Response: {response.text}")
+                except Exception as e:
+                    print(f"Telegram API Error for {zip_filename}: {e}")
+            else:
+                print("Skipping Telegram send: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured.")
+            
+            # 4. Clean up the created zip file
+            os.remove(zip_path)
+        
+        print("File organization and sending process completed.")
+        
+        # 5. Clean up downloaded files (optional but recommended to prevent excessive CI space usage)
+        print("Cleaning up individual configuration files...")
+        for file in glob.glob(os.path.join(DOWNLOAD_DIR, '*')):
+            os.remove(file)
+        # Re-save the log file after cleanup (it should be empty now)
+        self.save_downloaded_ids(set())
 
 
     def run(self, username, password):
@@ -283,6 +388,9 @@ class ProtonVPN:
                 
                 if all_downloads_finished:
                     print("\n###################### All configurations downloaded successfully! ######################")
+                    # --- NEW: Organize and send files after all downloads are complete ---
+                    self.organize_and_send_files()
+                    # --------------------------------------------------------------------
                 else:
                     print(f"Session {session_count} completed. Waiting {RELOGIN_DELAY} seconds before relogging in...")
                     time.sleep(RELOGIN_DELAY) 
@@ -304,6 +412,5 @@ if __name__ == "__main__":
         print("---")
     else:
         print("Account info loaded from environment variables. Starting workflow...")
-        # Since we use a log file to track downloaded IDs, we DO NOT need to clear the downloaded configs folder here.
         proton = ProtonVPN()
         proton.run(USERNAME, PASSWORD)
